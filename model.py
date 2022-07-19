@@ -7,7 +7,7 @@ import itertools
 
 
 class Network:
-    def __init__(self, name='rnn', N=100, S=0, R=1, g=1.2, fb_type='random', seed=1):
+    def __init__(self, name='random', N=100, S=0, R=1, g=1.2, fb_type='random', seed=1):
         self.name = name
         npr.seed(seed)
         # network parameters
@@ -20,7 +20,14 @@ class Network:
         self.z0 = []    # initial condition
         self.ha_before, self.ha, self.ra, self.ua = [], [], [], []      # activity, output
         self.ws = (2 * npr.random((N, S)) - 1) / sqrt(S)                # input weights
-        self.J = self.g * npr.standard_normal([N, N]) / np.sqrt(N)      # recurrent weights
+        if self.name == 'random':
+            self.J = self.g * npr.standard_normal([N, N]) / np.sqrt(N)      # recurrent weights
+        elif self.name == 'hub':
+            self.J = self.g * npr.standard_normal([N, N]) / np.sqrt(N)      # recurrent weights
+            J_diag = np.diag(np.diag(self.J))
+            self.J[1:, 1:] = 0
+            self.J[1:, 0] = self.J[1:, 0] * np.sqrt(N)
+            # self.J += J_diag * np.sqrt(N/2)
         self.wr = (2 * npr.random((R, N)) - 1) / sqrt(N)                # readout weights
         self.fb_type = fb_type
         if fb_type == 'random':

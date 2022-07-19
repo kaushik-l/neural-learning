@@ -6,7 +6,7 @@
 #SBATCH --job-name=rflo          # The job name.
 #SBATCH -c 4                     # The number of cpu cores to use
 #SBATCH -N 1                     # The number of nodes to use
-#SBATCH -t 0-02:00               # Runtime in D-HH:MM
+#SBATCH -t 0-04:00               # Runtime in D-HH:MM
 #SBATCH --mem-per-cpu=5gb        # The memory the job will use per cpu core
 
 module load anaconda
@@ -19,7 +19,12 @@ module load anaconda
 
 #Command to execute Python program
 
-#python main_batch.py 'rflo' $SLURM_ARRAY_TASK_ID
-#python main_batch.py 'bptt' $SLURM_ARRAY_TASK_ID
+python main_batch.py 'rflo_random' $SLURM_ARRAY_TASK_ID
+python main_batch.py 'neural_random' $SLURM_ARRAY_TASK_ID
+python main_batch.py 'bptt_random' $SLURM_ARRAY_TASK_ID
+
+#python main_batch.py 'rflo_hub' $SLURM_ARRAY_TASK_ID
+#python main_batch.py 'neural_hub' $SLURM_ARRAY_TASK_ID
+#python main_batch.py 'bptt_hub' $SLURM_ARRAY_TASK_ID
 
 #End of script

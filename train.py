@@ -92,7 +92,6 @@ def train_rflo(arch='rnn', N=100, S=0, R=1, g=1.2, task='ComplexSine', duration=
         sa = np.zeros((NT, S))  # save the inputs for each time bin for plotting
         ha = np.zeros((NT, N))  # save the hidden states for each time bin for plotting
         ua = np.zeros((NT, R))  # angular acceleration of joints
-        pa = np.zeros((NT, N))  # eligibility traces
 
         # errors
         err = np.zeros((NT, R))     # error in angular acceleration
@@ -144,6 +143,146 @@ def train_rflo(arch='rnn', N=100, S=0, R=1, g=1.2, task='ComplexSine', duration=
                     dwr += (((lr_out / NT) * h) * err[ti]).T
                 if lr_cc:
                     dJ += ((lr_cc / NT) * np.matmul(net.B, err[ti]).reshape(N, 1) * p)
+
+        # offline update
+        if not algo.online:
+            net.ws += dws
+            net.wr += dwr
+            net.J += dJ
+            net.B = net.wr.T * np.sqrt(N / R) if fb_type == 'aligned' else net.B    # realign feedback if needed
+
+        # compute overlap
+        learning['alignment']['feedback'].append((net.wr.flatten() @ net.B.flatten('F')) /
+                                                 (np.linalg.norm(net.wr.flatten()) * np.linalg.norm(net.B.flatten('F'))))
+
+        # kernel
+        epochs = np.concatenate((np.arange(1, 256, 2), 2 ** np.arange(8, int(np.ceil(np.log2(Nepochs))))))
+        if ei+1 in epochs and lr_cc > 0:
+            ha_ = ha - ha.mean(axis=1)[:, None].repeat(N,1)
+            learning['kernel'].append(np.matmul(ha_, ha_.T))
+            learning['ua_ei'].append(ua)
+            learning['kernel_ei'].append(ei+1)
+
+        # print loss
+        mse = task.loss(err)
+        if (ei+1) % 10 == 0: print('\r' + str(ei + 1) + '/' + str(algo.Nepochs) + '\t Err:' + str(mse), end='')
+
+        # save mse list and cond list
+        learning['mses'].append(mse)
+
+        # adaptive learning rate
+        if lr_cc:
+            lr_cc *= np.exp(np.log(np.minimum(1e-2, lr_cc) / lr_cc) / Nepochs)
+            learning['lr'].append(lr_cc)
+            learning['epoch'].append(ei)
+
+    # save input, activity, output
+    net.ha, net.ua = ha, ua
+    _, learning['test_ua'], learning['test_err'], learning['test_mse'] = simulate(net, task)
+
+    return net, task, algo, learning
+
+
+# train using neural
+def train_neural(arch='rnn', N=100, S=0, R=1, g=1.2, task='ComplexSine', duration=100, cycles=1,
+               rand_init=False, algo='neural', fb_type='random', Nepochs=10000, lr=1e-1, online=True, seed=1):
+
+    # instantiate model
+    net = Network(arch, N, S, R, g=g, fb_type=fb_type, seed=seed)
+    task = Task(task, duration, cycles, rand_init=rand_init)
+    algo = Algorithm(algo, Nepochs, lr, online)
+
+    # frequently used vars
+    dt, NT, N, S, R = net.dt, task.NT, net.N, net.S, net.R
+    t = dt * np.arange(NT)
+
+    # track variables during learning
+    learning = {'epoch': [], 'lr': [], 'mses': [],
+                'ev_svd': [], 'ev_diag': [], 'dim_svd': [], 'J0': np.empty_like(net.J),
+                'kernel': [], 'ua_ei': [], 'kernel_ei': [],
+                'alignment': {'feedback': []},
+                'test_ua': [], 'test_err': [], 'test_mse': []
+                }
+
+    # random initialization of hidden state
+    z0 = npr.randn(N, 1)    # hidden state (potential)
+    net.z0 = z0  # save
+
+    # save initial weights
+    learning['J0'][:] = net.J
+
+    # learning rates
+    lr_in = lr_cc = lr_out = algo.lr
+
+    # statistical analysis
+    reg = LinearRegression()
+    svd = TruncatedSVD(n_components=int(N - 1))
+
+    for ei in range(algo.Nepochs):
+
+        # initialize activity
+        z0 = net.z0 + 0.1*npr.randn(N, 1) if task.rand_init else net.z0  # hidden state (potential)
+        h0 = net.f(z0)  # hidden state (rate)
+        z, h = z0, h0
+
+        # save tensors for plotting
+        sa = np.zeros((NT, S))  # save the inputs for each time bin for plotting
+        ha = np.zeros((NT, N))  # save the hidden states for each time bin for plotting
+        ua = np.zeros((NT, R))  # angular acceleration of joints
+
+        # errors
+        err = np.zeros((NT, R))     # error in angular acceleration
+
+        # eligibility traces o, p
+        o = np.zeros((N, N, S))
+        p_old = np.zeros((N, N, N))
+
+        # store weight changes for offline learning
+        dws = np.zeros_like(net.ws)
+        dwr = np.zeros_like(net.wr)
+        dJ = np.zeros_like(net.J)
+
+        for ti in range(NT):
+
+            # network update
+            s = task.s[:, ti]
+            Iin = np.matmul(net.ws, s)[:, None] if net.S else 0
+            Irec = np.matmul(net.J, h)
+            z = Iin + Irec                  # potential
+
+            # update eligibility trace
+            p = np.zeros((N, N, N))
+            cov = net.df(z) * h.T
+            for i in range(N):
+                cov_i = np.zeros((N, N))
+                cov_i[i] = cov[i]
+                p[i] = (1 - dt) * p_old[i] + dt * cov_i + dt * net.df(z[i]) * np.einsum('j,jkl', net.J[i], p_old)
+
+            # update activity
+            h = (1 - dt) * h + dt * (net.f(z))  # cortex
+            u = np.matmul(net.wr, h)  # output
+
+            # save values for plotting
+            sa[ti], ha[ti], ua[ti] = s.T, h.T, u.T
+
+            # error
+            err[ti] = task.ustar[ti] - u
+
+            # online weight update
+            if algo.online:
+                if lr_out:
+                    net.wr += (((lr_out / NT) * h) * err[ti]).T
+                if lr_cc:
+                    for i in range(N):
+                        net.J[i] += ((lr_cc / NT) * net.B[i] * err[ti] * p[i, i])
+                net.B = net.wr.T * np.sqrt(N / R) if fb_type == 'aligned' else net.B    # realign feedback if needed
+            else:
+                if lr_out:
+                    dwr += (((lr_out / NT) * h) * err[ti]).T
+                if lr_cc:
+                    for i in range(N):
+                        dJ[i] += ((lr_cc / NT) * net.B[i] * err[ti] * p[i, i])
+            p_old = p
 
         # offline update
         if not algo.online:
@@ -257,7 +396,7 @@ def train_bptt(arch='ThCtx', N=256, S=0, R=1, g=1.2, task='ComplexSine', duratio
 
         # print loss
         loss = task.loss(err)
-        print('\r' + str(ei + 1) + '/' + str(algo.Nepochs) + '\t Err:' + str(loss.item()), end='')
+        if (ei+1) % 10 == 0: print('\r' + str(ei + 1) + '/' + str(algo.Nepochs) + '\t Err:' + str(loss.item()), end='')
 
         # save mse list and cond list
         learning['mses'].append(loss.item())
